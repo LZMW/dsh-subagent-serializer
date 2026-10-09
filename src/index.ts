@@ -151,7 +151,7 @@ async function waitForEngineIdle(
 class SubagentGate {
   #capacity: number;
   #running = 0; // 已确认运行的槽（含孤儿）
-  #entries: { kind: "start" | "wake"; at: number; timer?: ReturnType<typeof setTimeout> }[] = [];
+  #entries: { kind: "start" | "wake"; at: number; timer?: ReturnType<typeof setTimeout>; phase?: "gating" | "spawning"; spawnAt?: number }[] = [];
   #waiters: { wait: Promise<void>; cancelled: boolean; kind: "start" | "wake"; resolve: () => void; cancel: () => void }[] = [];
   #watchdogMs: number;
   #wakeHoldMs: number;
@@ -211,17 +211,21 @@ class SubagentGate {
   }
 
   /** 压入一个未确认持有者。WAKE 宽限不在此起表——由 armWakeGrace 在投递前起表
-   * （R1 修复），使持有期只从投递后算起。 */
+   * （R1 修复），使持有期只从投递后算起。phase 记录门控阶段：启动看门狗只释放
+   * spawning（已发起 spawn）的持有者，延迟/空闲等待（gating）不会被误判为启动
+   * 丢失（F1 修复）。 */
   #armEntry(kind: "start" | "wake"): void {
-    const entry: { kind: "start" | "wake"; at: number; timer?: ReturnType<typeof setTimeout> } = { kind, at: Date.now() };
+    const entry: { kind: "start" | "wake"; at: number; timer?: ReturnType<typeof setTimeout>; phase?: "gating" | "spawning"; spawnAt?: number } = { kind, at: Date.now(), phase: "gating" };
     this.#entries.push(entry);
     this.#armLaunch();
   }
 
-  /** 为最旧的未确认 wake entry 起宽限定时器并标记投递。在 next() 前（delay +
-   * 引擎空闲之后）调用，宽限从真正投递时算起。 */
+  /** 为尚无宽限定时器的最旧 wake entry 起表。在 next() 前（delay + 引擎空闲
+   * 之后）调用，宽限从真正投递时算起。`timer === undefined` 过滤使并发多个
+   * WAKE 时各钩子武装自己的 entry：第二个钩子跳过已武装的第一条，而不是重置
+   * 它并让自己的 entry 没有宽限（F2 修复）。 */
   armWakeGrace(): void {
-    const entry = this.#entries.find((e) => e.kind === "wake");
+    const entry = this.#entries.find((e) => e.kind === "wake" && e.timer === undefined);
     if (entry === undefined || this.#wakeHoldMs <= 0) return;
     if (entry.timer !== undefined) clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
@@ -233,6 +237,18 @@ class SubagentGate {
         this.#pump();
       }
     }, this.#wakeHoldMs);
+  }
+
+  /** 把最旧的仍在 gating 的 START entry 标记为 spawning（其钩子即将调用
+   * next()）。启动看门狗从此刻起算持有时长，延迟/空闲等待不会被误判为
+   * 启动丢失（F1 修复）。匿名 FIFO 注意：capacity>1 且各钩子进度不一时，
+   * 被标记的 entry 可能属于另一个钩子（有 fail-open 兜底）；默认 capacity=1
+   * （且引擎探测会 clamp 到 total_slots）时精确无误。 */
+  markSpawning(): void {
+    const entry = this.#entries.find((e) => e.kind === "start" && e.phase === "gating");
+    if (entry === undefined) return;
+    entry.phase = "spawning";
+    entry.spawnAt = Date.now();
   }
 
   confirmRunning(): void {
@@ -274,7 +290,9 @@ class SubagentGate {
     return false;
   }
 
-  /** 启动看门狗：未确认 START 槽被占过久且后面有排队者时才释放；否则保留重 arm。 */
+  /** 启动看门狗：START 槽在真正发起 spawn（markSpawning）之后超过 watchdogMs
+   * 且后面有排队者时才释放；gating 阶段（延迟/空闲等待）是合法持槽，不会被
+   * 释放；无人等待时保留并重 arm。 */
   #armLaunch(): void {
     this.#disarmLaunch();
     if (this.#watchdogMs <= 0) return;
@@ -284,7 +302,9 @@ class SubagentGate {
         const oldest = this.#entries[0];
         if (this.#waiters.length > 0
           && oldest.kind === "start"
-          && Date.now() - oldest.at >= this.#watchdogMs) {
+          && oldest.phase === "spawning"
+          && oldest.spawnAt !== undefined
+          && Date.now() - oldest.spawnAt >= this.#watchdogMs) {
           this.#onWarn?.(`unconfirmed START slot held ${this.#watchdogMs}ms and a call is blocked; force-releasing it (fail-open)`);
           this.releaseUnconfirmed();
         }
@@ -380,7 +400,7 @@ function raceTimeout(wait: Promise<void>, timeoutMs: number): Promise<boolean> {
  *   → 启动；槽位持有到 subagent/end。
  * - WAKE（send_message）：主代理发起时占预留槽 + 延迟 + 等引擎空闲 + 投递，投递后
  *   由被唤醒子代理的 end 或 per-entry 宽限释放；子代理身份发起直通。
- * - 子代理身份发起的任何工具调用直通（避免自我等待死锁）。
+ * - 子代理身份发起的调用跳过占位与延迟，但保留引擎空闲等待（避免自我等待死锁）。
  * - INTERRUPT（interrupt_agent）：立即直通。
  * team_roles/team_find 是纯查询工具（不启动子代理），不拦截；
  * workflow 按设计排除（脚本编排器会扇出大量子代理）。
@@ -397,7 +417,7 @@ export function apply(ctx: Context, config: ConfigType): void {
     config.runningStaleMs,
     (msg) => log("warn", msg),
   );
-  ctx.effect(() => () => gate.dispose(), "dsh-subagent-serializer.gate");
+  ctx.effect(() => () => gate.dispose());
   const startTools = new Set(config.toolNames);
   const wakeTools = new Set(config.wakeToolNames);
   const interruptTools = new Set(config.interruptToolNames);
@@ -495,9 +515,16 @@ export function apply(ctx: Context, config: ConfigType): void {
 
       await waitForEngineIdleChecked(exec);
 
-      if (isWake) {
+      if (isStart) {
+        if (holdingSlot) {
+          // 启动看门狗从这里（真正 spawn 前）起算，而不是 acquire：延迟 + 空闲
+          // 等待是合法持槽，提前释放会让排队者被过度放行（F1 修复）。
+          gate.markSpawning();
+        }
+      } else if (holdingSlot) {
         // WAKE 宽限在此（投递前）起表：预留槽在 delay + 空闲等待期间保持，
-        // 只有被唤醒子代理始终未启动才超时释放（R1 修复）。
+        // 只有被唤醒子代理始终未启动才超时释放（R1 修复）。仅限自己持槽：
+        // 超时直通的 WAKE 没有 entry，不能替别人起宽限（F3 修复）。
         gate.armWakeGrace();
       }
     } catch (error) {

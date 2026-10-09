@@ -34,7 +34,7 @@
 | `tools/execute` waterfall 钩子 | 每次工具调用都会经过它；插件按工具类别拦截：START/WAKE 先排队 + 延迟 + 等引擎空闲再放行，INTERRUPT 直通 |
 | `subagent/start` / `subagent/end` 生命周期事件 | `@deepseek-ai/dsh-subagent` 在子代理启动/结束各发一次事件；`subagent/end` 释放并发槽位。`team_delegate` 内部同样通过 `ctx.subagents` 启动子代理，自动被覆盖。`send_message` 唤醒的 continuable 子代理按"孤儿 start"计数 |
 | 引擎探测（可选，fail-open） | 启动时 `GET /props` 读 `total_slots`，**自动把闸门容量钳制到引擎真实并发数**（如单并发引擎钳到 1）；每次 START/WAKE 前轮询 `/slots`，**等引擎所有槽位空闲才放行**。用 Node 内置 `fetch`（`ctx.web` 拒绝 loopback 地址，不能用）。任何探测失败自动回退固定延迟 |
-| 启动看门狗（watchdogMs） | 未确认的 START 槽被占过久时，**仅当有排队者被阻塞**才强制释放（慢启动的后台子代理不会被误杀；无人等待时保留并继续监控） |
+| 启动看门狗（watchdogMs） | START 槽在**真正发起 spawn 之后**（延迟与空闲等待完成，`markSpawning` 标记）仍未确认且有排队者被阻塞时才强制释放——延迟/空闲等待阶段的合法持槽不会被看门狗打断；无人等待时保留并继续监控，慢启动的后台子代理不会被误杀 |
 | WAKE 宽限（wakeHoldMs） | 主代理 send_message 的预留槽在投递后若被唤醒子代理始终未确认，宽限到期自动释放，避免槽位被人工占住 |
 | running 过期（runningStaleMs） | 运行中的槽位长时间未见 `subagent/end`（事件丢失）且有排队者时强制 vacate，防止计数永久泄漏 |
 | 排队超时（waitTimeoutMs） | fail-open：排队等待超过上限仍无空槽时直接放行（宁可短暂并发，不可永久挂起） |
@@ -49,7 +49,7 @@
 ```powershell
 cd dsh-subagent-serializer
 npm pack
-# 得到 dsh-subagent-serializer-0.1.0.tgz
+# 得到 dsh-subagent-serializer-0.2.1.tgz
 ```
 
 然后在 DSH 插件管理器（设置 → 插件）中安装该 tarball。
@@ -111,7 +111,7 @@ npm pack
 }
 ```
 
-> 提示：`watchdogMs` 建议 ≥ `delayMs + 60s`；`waitTimeoutMs`/`idleTimeoutMs`/`runningStaleMs` 按你的引擎最差单次处理时长（Strata + 262K 上下文可能 40–300 秒）留足余量。
+> 提示：`watchdogMs` 只约束"真正发起 spawn 之后"的未确认窗口（延迟/空闲等待不计入），无需覆盖 `delayMs`；按引擎最差单次处理时长（Strata + 262K 上下文可能 40–300 秒）留足余量即可。`waitTimeoutMs`/`idleTimeoutMs`/`runningStaleMs` 同样按最差处理时长留余量。
 
 ## 与 agents.md 的配合
 

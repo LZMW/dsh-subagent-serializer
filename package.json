@@ -1,7 +1,7 @@
 {
   "name": "dsh-subagent-serializer",
   "description": "Serialize subagent starts with a configurable delay for single-concurrency local inference (DeepSeek Harness host plugin)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
