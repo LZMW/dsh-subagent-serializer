@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# npm pack output
+*.tgz
+
+# Local probes / scratch
+_probe/
+_extract_tmp/
+_scratch/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
