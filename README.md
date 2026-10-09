@@ -121,13 +121,24 @@ npm pack
 
 ```
 dsh-subagent-serializer/
-├── package.json        # 插件清单（npm 包格式）
-├── lib/index.js        # 运行时入口（ESM，无构建依赖）
-├── lib/index.d.ts      # 类型声明
-├── src/index.ts        # 类型化源码（维护参考，行为与 lib 一致）
-├── templates/agents.md # agents.md 约束模板
+├── package.json            # 插件清单（npm 包格式）
+├── lib/index.js            # 运行时入口（ESM，无构建依赖）
+├── lib/index.d.ts          # 类型声明
+├── src/index.ts            # 类型化源码（维护参考，行为与 lib 一致）
+├── templates/agents.md     # agents.md 约束模板
+├── examples/
+│   └── basic-mode.patch.yml # 示例：把插件挂进自定义 agent preset（脱敏）
 └── README.md
 ```
+
+## 示例：把插件挂进自定义 agent preset（只对某模式启用）
+
+默认情况下插件作为独立插件启用后对所有会话生效。如果你希望**只在某个 agent 模式（preset）下启用**——例如创建一个"基础模式"（无 `workflow` 工具、启用单并发串行），而系统"标准模式"不受影响——参考 [`examples/basic-mode.patch.yml`](examples/basic-mode.patch.yml)：
+
+- 它声明了一个完整 preset（`id: basic-mode`），内容与 DSH 的 standard preset 一致，但**移除**了 `dsh-workflow-ptc` / `dsh-tool-workflow`，并**在 preset 内部**挂载了 `dsh-subagent-serializer`。
+- 把该文件的 `- insert:` 列表追加到你的 profile patch（如 `<DSH_HOME>/profiles/desktop/cordis.patch.yml`），重启 DSH 后新建会话即可在模式选择器里看到"基础模式"。
+- preset 是共享常驻挂载：所有选择该模式的会话共享同一个串行闸门，符合单并发语义。
+- 该文件为**脱敏示例**：不含任何个人 API 密钥、模型路由或机器路径，请按你自己的环境调整模型/provider 与 `engineUrl`。
 
 ## 行为边界与注意
 
