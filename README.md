@@ -23,8 +23,8 @@
 | 类别 | 工具（默认） | 策略 |
 |---|---|---|
 | **START**（启动） | `subagent` / `subagent_fork` / `team_delegate` | 排队占位 → 延迟 → 等引擎空闲 → 启动；槽位持有到 `subagent/end` |
-| **WAKE**（唤醒，主代理发起） | `send_message` | 同样占位（预留槽）→ 延迟 → 等引擎空闲 → 投递；投递后保持预留槽到被唤醒子代理的 `subagent/end`，或各自独立的 `wakeHoldMs` 宽限到期 |
-| **子代理身份发起的调用** | 任意上述工具 | **直通**——子代理已占用自己的 running 槽，任何再占槽的工具对它都是自我等待（回传结果给父代理、派孙代理、协调器委托等场景会死锁到超时，故必须豁免） |
+| **WAKE**（唤醒，主代理发起） | `send_message` | 同样占位（预留槽）→ 延迟 → 等引擎空闲 → 投递；**宽限在投递时才起表**，保持预留槽到被唤醒子代理的 `subagent/end`，或各自独立的 `wakeHoldMs` 宽限到期 |
+| **子代理身份发起的调用** | 任意上述工具 | **跳过闸门占位与延迟，但保留引擎空闲等待**——子代理已占自己的 running 槽，再占槽会自我等待（回传结果/派孙代理/协调器委托等场景会死锁到超时，故必须跳过占位）；保留引擎空闲检查使孙代理/协调器委托仍不与引擎当前生成撞车 |
 | **INTERRUPT**（中断） | `interrupt_agent` | 立即直通（停止操作必须即刻生效；其引发的 `subagent/end` 被闸门吸收并释放槽位） |
 
 ## 工作原理（对 DSH 源码的依赖）
@@ -75,7 +75,7 @@ npm pack
 | `watchdogMs` | number | `120000` | 启动看门狗：未确认 START 槽被占该时长且有排队者时释放 |
 | `waitTimeoutMs` | number | `600000` | 排队等待空槽/空闲的超时时间，超时后 fail-open 直接放行 |
 | `engineUrl` | string | `"http://127.0.0.1:8080"` | 引擎基础地址（Strata 默认）。设为 `""` 可关闭引擎探测 |
-| `waitForEngineIdle` | boolean | `true` | START/WAKE 前等待引擎所有槽位空闲（`/slots` 的 `is_processing=false`） |
+| `waitForEngineIdle` | boolean | `true` | START/WAKE 前等待引擎所有槽位空闲（`/slots` 的 `is_processing !== true`，缺失/0 也视为空闲） |
 | `enginePollMs` | number | `2000` | 等待空闲时的轮询间隔 |
 | `probeTimeoutMs` | number | `3000` | 单次 `/props`、`/slots` 请求超时 |
 | `idleTimeoutMs` | number | `600000` | 等待引擎空闲的总超时，超时后 fail-open 放行 |
@@ -84,8 +84,8 @@ npm pack
 
 **引擎探测的自动行为**：
 - 启动时读 `/props.total_slots`；若小于 `maxConcurrency`，**自动把闸门容量钳制为 `total_slots`**（单并发引擎 → 1）。日志会打印如 `engine reports total_slots=1; maxConcurrency clamped from 2 to 1`。
-- 探测**只在插件加载时做一次**；引擎之后重启改变 `total_slots` 不会被重新探测。
-- 空闲检查有**熔断**：引擎连续不可达（启动探测失败，或空闲轮询连续 3 次失败）后，本进程内停用 idle 等待，降级为固定延迟（fail-open）。
+- 探测**只在插件加载时做一次**；引擎之后重启改变 `total_slots` 不会被重新探测。启动探测失败（例如 `/props` 缺失）**不会**关闭空闲检查——`/slots` 可能仍然可用。
+- 空闲检查有**熔断**：空闲轮询连续 3 次失败后，本进程内停用 idle 等待，降级为固定延迟（fail-open）。
 - 探测或空闲检测**任何失败**都会打日志并回退到固定延迟（fail-open），绝不影响子代理委托。
 - 插件用 Node 内置 `fetch` 探测引擎——不能用 `ctx.web`，因为 DSH 的 web provider 出于安全拒绝 loopback/私有地址。
 - **没有引擎或不需要探测时，请把 `engineUrl` 设为 `""`**，否则每次委托调用都会先做空闲检查（引擎不可达时最多耗 3 次探测超时）。

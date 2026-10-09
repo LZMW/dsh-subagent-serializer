@@ -187,8 +187,10 @@ class SubagentGate {
     }
   }
 
-  /** 立即放行则返回 undefined；否则返回可取消的排队句柄。kind 为 'start'|'wake'。 */
+  /** 立即放行则返回 undefined；否则返回可取消的排队句柄。kind 为 'start'|'wake'。
+   * 插件停用（dispose）后直接放行（直通语义），不阻塞 in-flight 钩子。 */
   acquire(kind: "start" | "wake"): { promise: Promise<void>; cancel: () => void } | undefined {
+    if (this.#disposed) return undefined;
     if (this.#entries.length + this.#running < this.#capacity) {
       this.#armEntry(kind);
       return undefined;
@@ -208,22 +210,29 @@ class SubagentGate {
     return { promise, cancel: () => entry.cancel() };
   }
 
-  /** 压入一个未确认持有者；WAKE 附带其独立宽限定时器。 */
+  /** 压入一个未确认持有者。WAKE 宽限不在此起表——由 armWakeGrace 在投递前起表
+   * （R1 修复），使持有期只从投递后算起。 */
   #armEntry(kind: "start" | "wake"): void {
     const entry: { kind: "start" | "wake"; at: number; timer?: ReturnType<typeof setTimeout> } = { kind, at: Date.now() };
-    if (kind === "wake" && this.#wakeHoldMs > 0) {
-      entry.timer = setTimeout(() => {
-        entry.timer = undefined;
-        const idx = this.#entries.indexOf(entry);
-        if (idx >= 0) {
-          this.#onWarn?.(`WAKE reservation unconfirmed after ${this.#wakeHoldMs}ms; releasing it (fail-open)`);
-          this.#entries.splice(idx, 1);
-          this.#pump();
-        }
-      }, this.#wakeHoldMs);
-    }
     this.#entries.push(entry);
     this.#armLaunch();
+  }
+
+  /** 为最旧的未确认 wake entry 起宽限定时器并标记投递。在 next() 前（delay +
+   * 引擎空闲之后）调用，宽限从真正投递时算起。 */
+  armWakeGrace(): void {
+    const entry = this.#entries.find((e) => e.kind === "wake");
+    if (entry === undefined || this.#wakeHoldMs <= 0) return;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      const idx = this.#entries.indexOf(entry);
+      if (idx >= 0) {
+        this.#onWarn?.(`WAKE reservation unconfirmed after ${this.#wakeHoldMs}ms; releasing it (fail-open)`);
+        this.#entries.splice(idx, 1);
+        this.#pump();
+      }
+    }, this.#wakeHoldMs);
   }
 
   confirmRunning(): void {
@@ -325,7 +334,8 @@ class SubagentGate {
     }
   }
 
-  /** 插件停用/HMR：清定时器、拒绝新放行。in-flight 钩子继续 next()（fail-open）。 */
+  /** 插件停用/HMR：清定时器、放行排队等待者（fail-open）、拒绝新放行。
+   * in-flight 钩子继续 next()；排队调用立即放行，不挂到 waitTimeoutMs。 */
   dispose(): void {
     this.#disposed = true;
     this.#disarmLaunch();
@@ -334,6 +344,11 @@ class SubagentGate {
       if (entry.timer !== undefined) clearTimeout(entry.timer);
     }
     this.#entries = [];
+    const waiters = this.#waiters;
+    this.#waiters = [];
+    for (const entry of waiters) {
+      entry.resolve(); // fail-open: 放行排队调用
+    }
   }
 }
 
@@ -399,6 +414,7 @@ export function apply(ctx: Context, config: ConfigType): void {
   });
 
   // 异步引擎探测（fail-open，不阻塞加载）：确认引擎真实并发数并 clamp 容量。
+  // 探测失败**不**置熔断（R4 修复）：/props 可能缺失而 /slots 可用，保持 idle 检查启用。
   if (probeEnabled) {
     (async () => {
       const slots = await probeEngineSlots(engineUrl, config.probeTimeoutMs, (msg) => log("warn", msg));
@@ -407,10 +423,22 @@ export function apply(ctx: Context, config: ConfigType): void {
         log("info", `engine reports total_slots=${slots}; maxConcurrency clamped from ${config.maxConcurrency} to ${slots}`);
       } else if (slots !== undefined) {
         log("info", `engine probe: total_slots=${slots}; gate capacity stays at ${config.maxConcurrency}`);
-      } else {
-        idleWaitDisabled = true;
       }
     })();
+  }
+
+  /** 等待引擎空闲，遵循熔断。fail-open。 */
+  async function waitForEngineIdleChecked(exec: any): Promise<void> {
+    if (!probeEnabled || !config.waitForEngineIdle || idleWaitDisabled) return;
+    await waitForEngineIdle(
+      engineUrl,
+      config.enginePollMs,
+      config.idleTimeoutMs,
+      config.probeTimeoutMs,
+      exec?.signal,
+      (msg) => log("info", msg),
+      () => { idleWaitDisabled = true; log("warn", "engine idle probing failing repeatedly; disabling idle waits in this process (fail-open)"); },
+    );
   }
 
   ctx.on("tools/execute", async (exec: any, next: () => Promise<unknown>) => {
@@ -427,9 +455,18 @@ export function apply(ctx: Context, config: ConfigType): void {
     const isWake = wakeTools.has(name);
     if (!isStart && !isWake) return next();
 
-    // 子代理身份发起的调用直通（回传结果给父代理 / 派孙代理 / 协调器委托）：
-    // 它已占用自己的 running 槽，任何再占槽的工具对它都是自我等待（死锁）。
-    if (isSubagentCaller(exec)) return next();
+    if (isSubagentCaller(exec)) {
+      // 子代理身份发起的调用（回传结果/派孙代理/协调器委托）已占用自己的 running
+      // 槽，再占闸门槽会自我等待（死锁）。跳过 acquire + delay，但保留引擎空闲
+      // 等待（R5 修复）：孙代理/协调器委托仍不与引擎当前生成撞车；空闲检查是纯读，
+      // 不占槽、无自我等待。
+      try {
+        await waitForEngineIdleChecked(exec);
+      } catch (error) {
+        log("warn", `${name}: subagent-origin engine idle check failed (${String((error as Error).message ?? error)}); proceeding (fail-open)`);
+      }
+      return next();
+    }
 
     let holdingSlot = false;
 
@@ -456,16 +493,12 @@ export function apply(ctx: Context, config: ConfigType): void {
         await sleep(config.delayMs, exec?.signal);
       }
 
-      if (probeEnabled && config.waitForEngineIdle && !idleWaitDisabled) {
-        await waitForEngineIdle(
-          engineUrl,
-          config.enginePollMs,
-          config.idleTimeoutMs,
-          config.probeTimeoutMs,
-          exec?.signal,
-          (msg) => log("info", msg),
-          () => { idleWaitDisabled = true; log("warn", "engine idle probing failing repeatedly; disabling idle waits in this process (fail-open)"); },
-        );
+      await waitForEngineIdleChecked(exec);
+
+      if (isWake) {
+        // WAKE 宽限在此（投递前）起表：预留槽在 delay + 空闲等待期间保持，
+        // 只有被唤醒子代理始终未启动才超时释放（R1 修复）。
+        gate.armWakeGrace();
       }
     } catch (error) {
       log("warn", `${name}: plugin gate error (${String((error as Error).message ?? error)}); proceeding (fail-open)`);
