@@ -27,12 +27,22 @@
 | **子代理身份发起的调用** | 任意上述工具 | **跳过闸门占位与延迟，但保留引擎空闲等待**——子代理已占自己的 running 槽，再占槽会自我等待（回传结果/派孙代理/协调器委托等场景会死锁到超时，故必须跳过占位）；保留引擎空闲检查使孙代理/协调器委托仍不与引擎当前生成撞车 |
 | **INTERRUPT**（中断） | `interrupt_agent` | 立即直通（停止操作必须即刻生效；其引发的 `subagent/end` 被闸门吸收并释放槽位） |
 
+## 版本与 DSH 兼容性
+
+| DSH | 本插件 | 说明 |
+|---|---|---|
+| **0.2.1-rc.1 及以上** | 0.2.2+ | 0.2.1 把委派改成「工具在 activation 建立时立即返回 childId，子代理在后台跑完再结算」；闸门仍以 `subagent/start` → `subagent/end` 为界，槽位跟踪的是**真实子代理运行**而不是工具调用，行为不变（已对 0.2.1-rc.2 源码复核） |
+| 0.2.0 及更早 | 0.2.1 | 同上，工具调用本身会阻塞到子代理结束 |
+
+> 顺带提醒：0.2.1 移除了 `cwd` 提示变量，`{{cwd}}` 已不可用（工作目录由 `dsh-working-directory` 作为必需运行时上下文注入）。
+> 本插件的 `templates/agents.md` 与示例配置不涉及该变量，无需改动。
+
 ## 工作原理（对 DSH 源码的依赖）
 
 | 机制 | 说明 |
 |---|---|
 | `tools/execute` waterfall 钩子 | 每次工具调用都会经过它；插件按工具类别拦截：START/WAKE 先排队 + 延迟 + 等引擎空闲再放行，INTERRUPT 直通 |
-| `subagent/start` / `subagent/end` 生命周期事件 | `@deepseek-ai/dsh-subagent` 在子代理启动/结束各发一次事件；`subagent/end` 释放并发槽位。`team_delegate` 内部同样通过 `ctx.subagents` 启动子代理，自动被覆盖。`send_message` 唤醒的 continuable 子代理按"孤儿 start"计数 |
+| `subagent/start` / `subagent/end` 生命周期事件 | `@deepseek-ai/dsh-subagent` 在子代理 activation 建立/结算时各发一次事件；`subagent/end` 释放并发槽位。0.2.1 起工具在 activation 建立时即返回，因此"工具已返回"不等于"子代理已结束"——槽位以 end 为准。`team_delegate` 内部同样通过 `ctx.subagents` 启动子代理，自动被覆盖。`send_message` 唤醒的 continuable 子代理按"孤儿 start"计数 |
 | 引擎探测（可选，fail-open） | 启动时 `GET /props` 读 `total_slots`，**自动把闸门容量钳制到引擎真实并发数**（如单并发引擎钳到 1）；每次 START/WAKE 前轮询 `/slots`，**等引擎所有槽位空闲才放行**。用 Node 内置 `fetch`（`ctx.web` 拒绝 loopback 地址，不能用）。任何探测失败自动回退固定延迟 |
 | 启动看门狗（watchdogMs） | START 槽在**真正发起 spawn 之后**（延迟与空闲等待完成，`markSpawning` 标记）仍未确认且有排队者被阻塞时才强制释放——延迟/空闲等待阶段的合法持槽不会被看门狗打断；无人等待时保留并继续监控，慢启动的后台子代理不会被误杀 |
 | WAKE 宽限（wakeHoldMs） | 主代理 send_message 的预留槽在投递后若被唤醒子代理始终未确认，宽限到期自动释放，避免槽位被人工占住 |

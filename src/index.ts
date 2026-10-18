@@ -4,6 +4,10 @@
 // 实际运行时加载的是 lib/index.js（ESM，无构建依赖）。
 // 类型仅做文档用途；与 lib/index.js 的行为保持一致。
 // ---------------------------------------------------------------------------
+// 兼容性：DSH 0.2.1-rc.1 起委派改为「工具在 activation 建立时立即返回 childId，
+// 子代理在后台跑完再结算」，闸门仍以 subagent/start → subagent/end 为界，
+// 因此本插件的行为不需要改动（已对 0.2.1-rc.2 源码复核）。
+// ---------------------------------------------------------------------------
 
 import z from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
