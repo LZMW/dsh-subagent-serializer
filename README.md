@@ -11,6 +11,20 @@
 1. **延迟启动**：主代理调用委托工具时，工具调用会先"悬停" `delayMs`（默认 30 秒），之后才真正执行。给主代理留出停止工作的缓冲，也避免与引擎当前正在处理的请求撞车。
 2. **尽力串行**：插件内部维护一个并发闸门（默认容量 1）。正常情况下同一时刻只有一个子代理在运行，后续调用自动排队，前一个 `subagent/end` 事件到达后才放行下一个。
 3. **等引擎空闲才启动**（可开关）：真正启动前轮询引擎 `/slots`，等所有槽位空闲才放行——尽力避免把子代理丢进引擎的 FIFO 排队中。
+4. **前台阻塞（0.2.3 起默认开启；0.2.4 重做放行判据；0.2.5 连唤醒一起阻塞）**：DSH 0.2.1 把委派改成了纯后台——`subagent`/`subagent_fork` 在子代理一建立 activation 时就返回 childId，主代理立刻继续生成，**与正在跑的子代理同时向引擎发请求**。本插件在 `tools/execute` 钩子里一直持有这次工具调用，直到该子代理停止干活：主代理拿不到工具结果就无法发下一个请求，引擎始终只有一个请求。
+
+   同样适用于**唤醒**（`send_message`，0.2.5 起默认阻塞）：不阻塞时消息一投递成功就返回，主代理继续生成、被唤醒的子代理同时生成，还是同一个重叠。
+
+   放行信号只有两个，都按 childId 精确匹配：
+
+   - 该 child 出现**新的** `subagent/end`（~0ms）；
+   - 连续两次采样到「agent idle **且 inbox 为空**」——覆盖事件丢失、外部后端、以及等待开始前就已经结束的情况。
+
+   **刻意不用 `subagents.waitForChildren()`**：0.2.1 的实现对「idle 但 inbox 里还有排队轮次」的子代理直接 `continue` 跳过，它可能在子代理还没开跑时就返回，拿它当放行信号会静默退回后台语义。同理，只看 `status !== "idle"` 也不够——DSH 会把子代理以 idle 状态"停放"在等待队列上。
+
+   `team_delegate` 的 `run_in_background` **无法**由插件改写：宿主在 `tools/execute` 之前就把 `exec.arguments` 深冻结了（写它会抛 TypeError），所以它和其它委派工具一样，由本插件在 Phase 3 自己阻塞；如果模型自己传了 `run_in_background: false`，那个调用本身就是前台、结果里已带子代理产出，插件不再二次等待。
+
+   等待全程 fail-open：超时（`foregroundTimeoutMs`）、调用被取消都会放行，并记日志说明是哪一侧放的。
 
 > **重要边界**：插件的串行保证是"**尽力而为**"而非绝对锁。以下情况会短暂超并发或降级为固定延迟：引擎探测/空闲检查失败（fail-open）、排队超时（waitTimeoutMs）、事件归属限制（见"已知限制"）。插件保证的是**绝不永久卡死委托**（每个等待点都有超时兜底）。
 
@@ -22,7 +36,7 @@
 
 | 类别 | 工具（默认） | 策略 |
 |---|---|---|
-| **START**（启动） | `subagent` / `subagent_fork` / `team_delegate` | 排队占位 → 延迟 → 等引擎空闲 → 启动；槽位持有到 `subagent/end` |
+| **START**（启动） | `subagent` / `subagent_fork` / `team_delegate` | 排队占位 → 延迟 → 等引擎空闲 → 启动；槽位持有到 `subagent/end`；`foreground: true` 时**工具调用本身也持有到子代理 settle**（主代理被卡住，不会并发） |
 | **WAKE**（唤醒，主代理发起） | `send_message` | 同样占位（预留槽）→ 延迟 → 等引擎空闲 → 投递；**宽限在投递时才起表**，保持预留槽到被唤醒子代理的 `subagent/end`，或各自独立的 `wakeHoldMs` 宽限到期 |
 | **子代理身份发起的调用** | 任意上述工具 | **跳过闸门占位与延迟，但保留引擎空闲等待**——子代理已占自己的 running 槽，再占槽会自我等待（回传结果/派孙代理/协调器委托等场景会死锁到超时，故必须跳过占位）；保留引擎空闲检查使孙代理/协调器委托仍不与引擎当前生成撞车 |
 | **INTERRUPT**（中断） | `interrupt_agent` | 立即直通（停止操作必须即刻生效；其引发的 `subagent/end` 被闸门吸收并释放槽位） |
@@ -31,8 +45,9 @@
 
 | DSH | 本插件 | 说明 |
 |---|---|---|
-| **0.2.1-rc.1 及以上** | 0.2.2+ | 0.2.1 把委派改成「工具在 activation 建立时立即返回 childId，子代理在后台跑完再结算」；闸门仍以 `subagent/start` → `subagent/end` 为界，槽位跟踪的是**真实子代理运行**而不是工具调用，行为不变（已对 0.2.1-rc.2 源码复核） |
-| 0.2.0 及更早 | 0.2.1 | 同上，工具调用本身会阻塞到子代理结束 |
+| **0.2.1-rc.1 及以上** | 0.2.5+ | 0.2.1 把委派改成「工具在 activation 建立时立即返回 childId，子代理在后台跑完再结算」——**主代理会继续生成并与子代理并发**，光靠闸门已不能保证单并发。0.2.5 起委派与唤醒都前台阻塞，按 childId 精确放行：新的 `subagent/end`，或连续两次「idle 且 inbox 空」；不再使用会跳过"idle 但有排队"的 `waitForChildren` |
+| 0.2.1-rc.1 及以上（不升级插件） | 0.2.2 | 只有闸门 + 延迟：子代理之间串行，但**主代理与子代理仍会并发**——这就是 0.2.1 之后"插件卡不住对话"的原因 |
+| 0.2.0 及更早 | 0.2.1 | 工具调用本身会阻塞到子代理结束（原生前台），插件只做延迟 + 闸门 |
 
 > 顺带提醒：0.2.1 移除了 `cwd` 提示变量，`{{cwd}}` 已不可用（工作目录由 `dsh-working-directory` 作为必需运行时上下文注入）。
 > 本插件的 `templates/agents.md` 与示例配置不涉及该变量，无需改动。
@@ -91,6 +106,9 @@ npm pack
 | `idleTimeoutMs` | number | `600000` | 等待引擎空闲的总超时，超时后 fail-open 放行 |
 | `wakeHoldMs` | number | `15000` | WAKE 预留槽投递后未确认时的宽限，到期自动释放 |
 | `runningStaleMs` | number | `600000` | running 槽长时间无 end 且有排队者时强制 vacate |
+| `foreground` | boolean | `true` | **前台阻塞**：START 工具调用一直持有到子代理 settle，主代理不会在子代理运行时发下一个请求（0.2.3 起，修复 0.2.1 后台委派导致的并发） |
+| `foregroundTimeoutMs` | number | `1800000` | 前台等待的安全上限，超时 fail-open 放行 |
+| `foregroundWakes` | boolean | `true` | 是否也把 `send_message` 阻塞到**它的目标子代理**停止干活（按 `agent_id` 精确匹配）。默认开：唤醒不阻塞时，主代理会与被唤醒的子代理并发，正是本插件要消除的那种重叠；设为 `false` 可恢复"投递完就走" |
 
 **引擎探测的自动行为**：
 - 启动时读 `/props.total_slots`；若小于 `maxConcurrency`，**自动把闸门容量钳制为 `total_slots`**（单并发引擎 → 1）。日志会打印如 `engine reports total_slots=1; maxConcurrency clamped from 2 to 1`。
@@ -117,9 +135,14 @@ npm pack
   "probeTimeoutMs": 3000,
   "idleTimeoutMs": 600000,
   "wakeHoldMs": 15000,
-  "runningStaleMs": 600000
+  "runningStaleMs": 600000,
+  "foreground": true,
+  "foregroundTimeoutMs": 1800000,
+  "foregroundWakes": true
 }
 ```
+
+> 前台阻塞开启后，`delayMs` 的等待发生在「主代理已经被工具调用卡住」的时段里，属于纯等待——可以把它调到 0~5000ms，不必再留 60 秒缓冲。
 
 > 提示：`watchdogMs` 只约束"真正发起 spawn 之后"的未确认窗口（延迟/空闲等待不计入），无需覆盖 `delayMs`；按引擎最差单次处理时长（Strata + 262K 上下文可能 40–300 秒）留足余量即可。`waitTimeoutMs`/`idleTimeoutMs`/`runningStaleMs` 同样按最差处理时长留余量。
 
@@ -138,8 +161,19 @@ dsh-subagent-serializer/
 ├── templates/agents.md     # agents.md 约束模板
 ├── examples/
 │   └── basic-mode.patch.yml # 示例：把插件挂进自定义 agent preset（脱敏）
+├── test/foreground.test.mjs # 前台阻塞回归测试（9 个用例，纯 node，无需宿主）
 └── README.md
 ```
+
+## 测试
+
+```powershell
+node test/foreground.test.mjs   # 期望输出 "ALL CASES PASSED"
+```
+
+测试不需要 DSH 宿主：它用最小化的 cordis 形状 ctx 直接驱动插件的 `tools/execute` 监听器，覆盖每个放行信号与每种失败模式（事件放行、idle 放行、超时、取消、唤醒按 id 精确匹配、"idle 但有待办不算结束"）。
+
+唯一前置条件：`@deepseek-ai/schemastery` 能解析（插件运行时的 peer 依赖）。直接在本仓库跑会缺它，把仓库装进 DSH profile（或在 DSH 的 profile 目录下跑同一份测试）即可。
 
 ## 示例：把插件挂进自定义 agent preset（只对某模式启用）
 
@@ -152,10 +186,10 @@ dsh-subagent-serializer/
 
 ## 行为边界与注意
 
-1. **延迟语义**：延迟加在 `subagent` 等工具调用上——主代理发出调用后，工具调用本身会阻塞 `delayMs` 才真正执行。前台/后台模式都生效。
-2. **前台模式**（`run_in_background: false`）：主代理本来就会等子代理结果，额外多等 `delayMs` 是预期成本。
-3. **批量委托的延迟叠加**：排队批量委托时，每个入队者在放行后才睡满 `delayMs`（批量 N 个 ≈ N×`delayMs` 纯睡眠）。这是设计使然——每个子代理启动前都要给主代理收尾缓冲；若批量任务多，可把 `delayMs` 调小。
-4. **send_message 发给活跃子代理**：主代理对正在运行的子代理发消息（steer）会排在它自己的槽位之后、等引擎空闲再投递——对引擎友好，但实际是"等闸门槽位"而非仅"等引擎空闲"，典型结果是子代理结束后才投递（steer 变成事后追问）。若你的工作流高度依赖实时 steer，可把 `send_message` 从 `wakeToolNames` 移除（逃生阀）。
+1. **延迟语义**：延迟加在 `subagent` 等工具调用上——主代理发出调用后，工具调用本身会阻塞 `delayMs` 才真正执行。
+2. **前台阻塞是默认行为**（0.2.5 起）：委派与唤醒的工具调用都会一直持有到子代理停止干活，"主代理趁等待并行做点别的"不存在。`foreground` / `foregroundWakes` 置 `false` 可退回后台语义（会重新出现主代理与子代理并发）。
+3. **批量委托的延迟叠加**：排队批量委托时，每个入队者在放行后才睡满 `delayMs`（批量 N 个 ≈ N×`delayMs` 纯睡眠）。若批量任务多，可把 `delayMs` 调小（前台阻塞生效时它只是纯等待）。
+4. **send_message 发给活跃子代理**：默认（`foregroundWakes: true`）会一直持有到目标子代理停止干活，投递失败的"事后追问"窗口被关掉；代价是主代理在唤醒期间不能说话。若你的工作流高度依赖实时 steer 手感，可把 `foregroundWakes` 设 `false`，或把 `send_message` 从 `wakeToolNames` 移除（逃生阀）。
 5. **workflow / team_roles / team_find**：有意不拦截（见上"重要边界"）。
 6. **fail-open 原则**：任何内部错误只记日志、不阻断工具调用；插件自身故障不会破坏子代理委托。
 7. **多会话并发**：闸门按插件实例（通常全局一个）计数。若你的本地引擎连"多个主代理会话同时跑"都扛不住，需要你在会话层再串行。
@@ -163,7 +197,8 @@ dsh-subagent-serializer/
 ## 开发与测试
 
 ```powershell
-node --check lib/index.js
+node --check lib/index.js          # 语法
+node test/foreground.test.mjs      # 前台阻塞回归测试（需 @deepseek-ai/schemastery 可解析）
 ```
 
 ## License

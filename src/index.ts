@@ -4,9 +4,19 @@
 // 实际运行时加载的是 lib/index.js（ESM，无构建依赖）。
 // 类型仅做文档用途；与 lib/index.js 的行为保持一致。
 // ---------------------------------------------------------------------------
-// 兼容性：DSH 0.2.1-rc.1 起委派改为「工具在 activation 建立时立即返回 childId，
-// 子代理在后台跑完再结算」，闸门仍以 subagent/start → subagent/end 为界，
-// 因此本插件的行为不需要改动（已对 0.2.1-rc.2 源码复核）。
+// 兼容性：DSH 0.2.1-rc.x 起委派改为「工具在 activation 建立时立即返回 childId，
+// 子代理在后台跑完再结算」。**这正是本插件 0.2.3 必须新增前台阻塞的原因**：
+// 闸门（gate）只保证"子代理之间"不并发，主代理在工具返回后会立刻发下一个请求，
+// 与本机单并发引擎上正在跑的子代理撞车。0.2.3 起 tools/execute 钩子会一直持有
+// 该次工具调用到子代理 settle（`foreground: true` 默认开启）：
+//   - team_delegate 有原生前台通道，直接把 run_in_background 改写成 false；
+//   - subagent / subagent_fork 没有前台开关，由插件 race(subagent/end,
+//   - team_delegate 的 run_in_background 参数**无法**由插件改写（宿主在
+//     tools/execute 之前就深冻结了 exec.arguments），它和其他委派工具一样由
+//     Phase 3 自己阻塞；
+//   - subagent / subagent_fork 没有前台开关，放行信号是两个：该 childId 的新
+//     subagent/end，或连续两次采样到「idle 且 inbox 空」；**不用**
+//     waitForChildren（它在「idle 但有排队」时直接跳过）。
 // ---------------------------------------------------------------------------
 
 import z from "@deepseek-ai/schemastery";
@@ -31,6 +41,12 @@ export const Config = z.object({
   idleTimeoutMs: z.number().min(1000).max(Number.MAX_SAFE_INTEGER).default(600000),
   wakeHoldMs: z.number().min(1000).max(Number.MAX_SAFE_INTEGER).default(15000),
   runningStaleMs: z.number().min(1000).max(Number.MAX_SAFE_INTEGER).default(600000),
+  /** Hold a START tool call open until its child settles (foreground semantics). */
+  foreground: z.boolean().default(true),
+  /** Safety cap on a foreground wait; the call is released (fail-open) after this. */
+  foregroundTimeoutMs: z.number().min(1000).max(Number.MAX_SAFE_INTEGER).default(1800000),
+  /** Also block `send_message` until the woken child ends its run. */
+  foregroundWakes: z.boolean().default(true),
 });
 
 type ConfigType = z.infer<typeof Config>;
@@ -386,16 +402,75 @@ function isSubagentCaller(exec: any): boolean {
   }
 }
 
-/** 排队等待超时即放行（fail-open），防止闸门卡死委托。 */
-function raceTimeout(wait: Promise<void>, timeoutMs: number): Promise<boolean> {
-  if (timeoutMs <= 0) return Promise.resolve(false);
+/** 排队等待 vs 超时 vs 调用方 abort 三者竞速。wait 自己先满足返回 undefined；
+ * 否则返回胜出原因（"timeout" / "aborted"）。被取消的回合不能干等满
+ * waitTimeoutMs：宿主会 drain 已开始的工具调用，队列不响应 abort 会冻住整轮。 */
+function raceTimeout(wait: Promise<void>, timeoutMs: number, signal?: AbortSignal): Promise<"timeout" | "aborted" | undefined> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(true), timeoutMs);
-    wait.then(() => {
+    let settled = false;
+    function onAbort() {
+      done("aborted");
+    }
+    function done(reason: "timeout" | "aborted" | undefined) {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      resolve(false);
-    });
+      if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+      resolve(reason);
+    }
+    const timer = setTimeout(() => done("timeout"), Math.max(0, timeoutMs));
+    if (typeof (timer as any).unref === "function") (timer as any).unref();
+    if (signal !== undefined) {
+      if (signal.aborted) {
+        done("aborted");
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    wait.then(() => done(undefined));
   });
+}
+
+/** 延迟读宿主服务，不声明 inject：服务未就绪时降级为「没有第二信号」，绝不让插件加载失败。 */
+function serviceOf(ctx: any, name: string): any {
+  try {
+    const get = typeof ctx.get === "function" ? ctx.get.bind(ctx) : undefined;
+    const service = get === undefined ? undefined : get(name);
+    if (service !== undefined) return service;
+    return ctx[name];
+  } catch {
+    return undefined;
+  }
+}
+
+/** 委派工具返回值里的 childId（subagent: activation；team_delegate: continuable）。 */
+function activationChildId(result: any): string | undefined {
+  try {
+    if (result === undefined || result === null || result.isError === true) return undefined;
+    const value = result.value;
+    if (value === undefined || value === null || typeof value !== "object") return undefined;
+    if (value.kind !== undefined && value.kind !== "activation" && value.kind !== "continuable") return undefined;
+    return typeof value.subagentId === "string" && value.subagentId.length > 0 ? value.subagentId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 唤醒类工具的目标 childId。`send_message` 的参数名是 `agent_id`
+ * （`@deepseek-ai/dsh-tool-subagent-control`）；入参对象被宿主冻结但可读。
+ * 认不出的形状返回 undefined（不阻塞）。 */
+function wakeTargetOf(exec: any): string | undefined {
+  try {
+    const args = exec === undefined || exec === null ? undefined : exec.arguments;
+    if (args === undefined || args === null || typeof args !== "object") return undefined;
+    for (const key of ["agent_id", "agentId", "child_id", "childId", "target_id", "targetId"]) {
+      const value = args[key];
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -429,12 +504,36 @@ export function apply(ctx: Context, config: ConfigType): void {
   // 熔断：引擎连续不可达后，本进程内停用每次调用的 idle 等待（fail-open）。
   let idleWaitDisabled = false;
 
+  // 前台簿记：等待需要回答「这个 child 在我开始等之后有没有发过新的 subagent/end」，
+  // Set 回答不了——已经 settle 过的 child 不能给后来的等待解套（唤醒场景正是如此），
+  // 所以按 childId 计数。`foregroundCountersMax` 封顶；被淘汰的 id 报 Infinity，
+  // 让跨过淘汰点的等待者释放而不是挂到超时。
+  const settleCounts = new Map<string, number>();
+  const settleOrder: string[] = [];
+  const foregroundCountersMax = 512;
+
+  function settlementCount(childId: string): number {
+    const count = settleCounts.get(childId);
+    return count === undefined ? 0 : count;
+  }
+
+  function noteSettled(childId: string): void {
+    settleCounts.set(childId, settlementCount(childId) + 1);
+    settleOrder.push(childId);
+    while (settleOrder.length > foregroundCountersMax) {
+      const evicted = settleOrder.shift();
+      if (evicted !== undefined) settleCounts.set(evicted, Number.POSITIVE_INFINITY);
+    }
+  }
+
   ctx.on("subagent/start", () => {
     gate.confirmRunning();
   });
 
-  ctx.on("subagent/end", () => {
+  ctx.on("subagent/end", (info: any) => {
     gate.vacate();
+    const childId = info !== undefined && info !== null && typeof info.id === "string" ? info.id : undefined;
+    if (childId !== undefined) noteSettled(childId);
   });
 
   // 异步引擎探测（fail-open，不阻塞加载）：确认引擎真实并发数并 clamp 容量。
@@ -465,6 +564,69 @@ export function apply(ctx: Context, config: ConfigType): void {
     );
   }
 
+  /**
+   * 该 child 现在是否在干活。true=在跑（或 idle 但 inbox 里还有排队的轮次）；
+   * false=活着但闲置且 inbox 空；undefined=查不到这个 agent。
+   * 只读 status 不够：0.2.1 的 waitForChildren 恰好 `continue` 掉「idle 但有排队」
+   * 的 child，用 `status !== "idle"` 做判据会与它同向失效、提前放行。
+   */
+  function childBusy(childId: string): boolean | undefined {
+    const agents = serviceOf(ctx, "agents");
+    const agent = agents !== undefined && typeof agents.get === "function" ? agents.get(childId) : undefined;
+    if (agent === undefined || agent === null) return undefined;
+    if (agent.status !== "idle") return true;
+    const inbox = agent.inbox;
+    if (inbox === undefined || inbox === null) return false;
+    const pending = (queue: any): boolean => {
+      if (Array.isArray(queue)) return queue.length > 0;
+      return typeof queue === "number" && queue > 0;
+    };
+    return pending(inbox.nextTurn) || pending(inbox.nextStep);
+  }
+
+  /**
+   * 阻塞调用方直到该 child 停止干活（前台语义）。
+   * 放行信号只有两个，**故意不用** `subagents.waitForChildren`：它对「idle 但 inbox
+   * 有排队」的 child 直接跳过，可能在 child 还没开跑时就返回。
+   *   1) 该 id 出现**新的** `subagent/end`（精确，~0ms）；
+   *   2) 连续两次采样到「idle 且 inbox 空」（覆盖事件丢失/外部后端/等待开始前就结束），
+   *      代价 ≤ 2×pollMs；
+   *   3) 兜底：foregroundTimeoutMs 与调用方 abort。
+   */
+  async function awaitChildSettled(exec: any, childId: string, seenCount: number, label: string): Promise<string> {
+    const startedAt = Date.now();
+    const deadline = startedAt + config.foregroundTimeoutMs;
+    const pollMs = Math.max(200, Math.min(1000, Math.floor(config.enginePollMs / 2) || 500));
+    let quiet = 0;
+
+    for (;;) {
+      if (settlementCount(childId) > seenCount) {
+        log("info", `${label}: subagent ${childId} settled after ${Date.now() - startedAt}ms (released by subagent/end)`);
+        return "subagent/end";
+      }
+      const busy = childBusy(childId);
+      if (busy === false) {
+        quiet += 1;
+        if (quiet >= 2) {
+          log("info", `${label}: subagent ${childId} idle for ${pollMs * quiet}ms without a new subagent/end (finished, or the event was missed); releasing after ${Date.now() - startedAt}ms`);
+          return "idle";
+        }
+      } else {
+        quiet = 0;
+      }
+      if (exec?.signal !== undefined && exec.signal.aborted) {
+        log("info", `${label}: call aborted after ${Date.now() - startedAt}ms while waiting for subagent ${childId}`);
+        return "aborted";
+      }
+      if (Date.now() >= deadline) {
+        log("warn", `${label}: subagent ${childId} did not settle within ${config.foregroundTimeoutMs}ms; releasing the call (fail-open)`);
+        return "timeout";
+      }
+      await sleep(pollMs, exec?.signal);
+    }
+  }
+
+  // 序列化 + 延迟委派工具。
   ctx.on("tools/execute", async (exec: any, next: () => Promise<unknown>) => {
     const name = exec === undefined ? undefined : exec.name;
     if (name === undefined) return next();
@@ -501,10 +663,13 @@ export function apply(ctx: Context, config: ConfigType): void {
       const handle = gate.acquire(kind);
       if (handle !== undefined) {
         log("info", `${name} queued (${gate.active} busy); waiting for a free slot`);
-        const timedOut = await raceTimeout(handle.promise, config.waitTimeoutMs);
-        if (timedOut) {
+        const released = await raceTimeout(handle.promise, config.waitTimeoutMs, exec?.signal);
+        if (released !== undefined) {
           handle.cancel();
-          log("warn", `${name} waited more than ${config.waitTimeoutMs}ms for a slot; proceeding anyway (fail-open)`);
+          log(released === "aborted" ? "info" : "warn",
+            released === "aborted"
+              ? `${name}: call aborted while queued; not taking a slot`
+              : `${name} waited more than ${config.waitTimeoutMs}ms for a slot; proceeding anyway (fail-open)`);
         } else {
           holdingSlot = true;
         }
@@ -538,8 +703,15 @@ export function apply(ctx: Context, config: ConfigType): void {
     }
 
     // Phase 2: 真正的工具调用。只有工具自身错误被 rethrow；失败时释放未确认槽。
+    // 注意：宿主在进入本 waterfall 之前已把 `exec.arguments` 深冻结（dsh-tools
+    // 的 createExecution），插件在结构上**不可能**改写别的工具的入参（例如强改
+    // `run_in_background: false`）。前台只能在 Phase 3 自己造出来。
+    const wakeTarget = isWake ? wakeTargetOf(exec) : undefined;
+    const wakeSeen = wakeTarget === undefined ? 0 : settlementCount(wakeTarget);
+
+    let result: any;
     try {
-      return await next();
+      result = await next();
     } catch (error) {
       if (holdingSlot) {
         if (!gate.releaseUnconfirmed()) {
@@ -548,6 +720,32 @@ export function apply(ctx: Context, config: ConfigType): void {
       }
       throw error;
     }
+
+    // Phase 3（前台）：一直持有本次工具调用到子代理停止干活。DSH 0.2.1 起工具在
+    // activation 时立即返回，主代理会继续生成并与子代理撞车；本阶段把它挡住。
+    // 所有失败路径 fail-open：仍然返回工具结果，插件自身问题绝不挂住委派。
+    try {
+      if (config.foreground && isStart) {
+        const childId = activationChildId(result);
+        if (childId === undefined) {
+          log("info", `${name}: no child id in the tool result (the call already produced the child's outcome); no wait needed`);
+        } else {
+          log("info", `${name}: foreground — holding the call until subagent ${childId} settles`);
+          await awaitChildSettled(exec, childId, settlementCount(childId), name);
+        }
+      } else if (config.foregroundWakes && isWake) {
+        if (wakeTarget === undefined) {
+          log("warn", `${name}: no target agent id in the call arguments; cannot block this wake`);
+        } else {
+          log("info", `${name}: foreground — holding the wake until agent ${wakeTarget} stops working`);
+          await awaitChildSettled(exec, wakeTarget, wakeSeen, name);
+        }
+      }
+    } catch (error) {
+      log("warn", `${name}: foreground wait failed (${String((error as Error).message ?? error)}); returning the tool result (fail-open)`);
+    }
+
+    return result;
   });
 }
 

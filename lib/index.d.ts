@@ -31,6 +31,18 @@ export interface SerializerConfig {
   wakeHoldMs: number;
   /** a running slot with no end for this long is force-vacated when calls are blocked (default 600000) */
   runningStaleMs: number;
+  /**
+   * Hold a START tool call open until its child stops working, so the caller
+   * cannot generate next to the child (default true).
+   */
+  foreground: boolean;
+  /** Safety cap on a foreground wait; the call is released (fail-open) after this (default 1800000) */
+  foregroundTimeoutMs: number;
+  /**
+   * Also hold `send_message` until its target child stops working, keyed off
+   * `agent_id` (default true).
+   */
+  foregroundWakes: boolean;
 }
 
 export const name: string;

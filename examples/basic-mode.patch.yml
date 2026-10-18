@@ -150,12 +150,17 @@
                   subagentProvider: spawn
                   maxRounds: 64
           # ── 单并发串行插件（仅本 preset 启用）──
-          # dsh-subagent-serializer：子代理延迟启动 + 强串行 + 等引擎空闲。
+          # dsh-subagent-serializer：前台阻塞（委派/唤醒都卡到子代理干完）+ 强串行
+          # + 延迟 + 等引擎空闲。0.2.5 起 foreground / foregroundWakes 默认就是 true，
+          # 下面显式写出只是为了可读性。
           # 挂在 preset 内部，故只有选择"基础模式"的会话才启用；"标准模式"无此插件。
           - id: dsh-subagent-serializer
             name: dsh-subagent-serializer
             config:
-              delayMs: 60000
+              delayMs: 5000
+              foreground: true
+              foregroundTimeoutMs: 1800000
+              foregroundWakes: true
               toolNames: ["subagent", "subagent_fork", "team_delegate"]
               wakeToolNames: ["send_message"]
               interruptToolNames: ["interrupt_agent"]
